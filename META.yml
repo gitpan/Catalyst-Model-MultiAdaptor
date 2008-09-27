@@ -1,7 +1,7 @@
 ---
 abstract: 'use plain classes as a Catalyst Model'
 author:
-  - 'dann <techmemo@gmail.com>'
+  - 'Takatoshi Kitano<kitano.tk@gmail.com>'
 build_requires:
   Catalyst: 0
   Catalyst::Controller: 0
@@ -25,4 +25,5 @@ requires:
   Module::Pluggable::Object: 0
   Moose: 0
   Sub::Install: 0
-version: 0.01
+  parent: 0
+version: 0.02

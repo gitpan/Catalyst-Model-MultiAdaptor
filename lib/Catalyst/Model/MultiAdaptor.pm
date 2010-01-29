@@ -1,10 +1,10 @@
 package Catalyst::Model::MultiAdaptor;
 use strict;
 use warnings;
-use Class::C3;
+use MRO::Compat;
 
-our $VERSION = '0.02';
-use parent 'Catalyst::Model::MultiAdaptor::Base';
+our $VERSION = '0.1';
+use base 'Catalyst::Model::MultiAdaptor::Base';
 
 sub new {
     my $class = shift;
@@ -108,7 +108,7 @@ Catalyst model.
 
 =head1 AUTHOR
 
-Takatoshi KitanoE<lt>kitano.tk@gmail.comE<gt>
+dann E<lt>techmemo@gmail.comE<gt>
 
 =head1 SEE ALSO
 

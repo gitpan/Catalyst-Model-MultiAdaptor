@@ -53,7 +53,7 @@ sub mk_compclass {
 
 =head1 AUTHOR
 
-Takatoshi Kitano C<< <kitano.tk@gmail.com> >>
+Dann C<< <techmemo@gmail.com> >>
 
 =head1 LICENSE
 

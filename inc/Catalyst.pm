@@ -2,9 +2,13 @@
 package Catalyst;
 
 use Moose;
+use Moose::Meta::Class ();
 extends 'Catalyst::Component';
-use bytes;
+use Moose::Util qw/find_meta/;
+use B::Hooks::EndOfScope ();
 use Catalyst::Exception;
+use Catalyst::Exception::Detach;
+use Catalyst::Exception::Go;
 use Catalyst::Log;
 use Catalyst::Request;
 use Catalyst::Request::Upload;
@@ -17,20 +21,20 @@ use Module::Pluggable::Object ();
 use Text::SimpleTable ();
 use Path::Class::Dir ();
 use Path::Class::File ();
-use Time::HiRes qw/gettimeofday tv_interval/;
 use URI ();
 use URI::http;
 use URI::https;
-use Scalar::Util qw/weaken blessed/;
 use Tree::Simple qw/use_weak_refs/;
 use Tree::Simple::Visitor::FindByUID;
+use Class::C3::Adopt::NEXT;
+use List::MoreUtils qw/uniq/;
 use attributes;
 use utf8;
-use Carp qw/croak carp/;
+use Carp qw/croak carp shortmess/;
 
-BEGIN { require 5.008001; }
+BEGIN { require 5.008004; }
 
-has stack => (is => 'rw', default => sub { [] });
+has stack => (is => 'ro', default => sub { [] });
 has stash => (is => 'rw', default => sub { {} });
 has state => (is => 'rw', default => 0);
 has stats => (is => 'rw');
@@ -40,17 +44,13 @@ has request => (is => 'rw', default => sub { $_[0]->request_class->new({}) }, re
 has response => (is => 'rw', default => sub { $_[0]->response_class->new({}) }, required => 1, lazy => 1);
 has namespace => (is => 'rw');
 
-attributes->import( __PACKAGE__, \&namespace, 'lvalue' );
-
 sub depth { scalar @{ shift->stack || [] }; }
 sub comp { shift->component(@_) }
 
 sub req {
-    # carp "the use of req() is deprecated in favour of request()";
     my $self = shift; return $self->request(@_);
 }
 sub res {
-    # carp "the use of res() is deprecated in favour of response()";
     my $self = shift; return $self->response(@_);
 }
 
@@ -61,13 +61,14 @@ sub finalize_output { shift->finalize_body(@_) };
 our $COUNT     = 1;
 our $START     = time;
 our $RECURSION = 1000;
-our $DETACH    = "catalyst_detach\n";
+our $DETACH    = Catalyst::Exception::Detach->new;
+our $GO        = Catalyst::Exception::Go->new;
 
 #I imagine that very few of these really need to be class variables. if any.
 #maybe we should just make them attributes with a default?
 __PACKAGE__->mk_classdata($_)
   for qw/components arguments dispatcher engine log dispatcher_class
-  engine_class context_class request_class response_class stats_class 
+  engine_class context_class request_class response_class stats_class
   setup_finished/;
 
 __PACKAGE__->dispatcher_class('Catalyst::Dispatcher');
@@ -78,7 +79,8 @@ __PACKAGE__->stats_class('Catalyst::Stats');
 
 # Remember to update this in Catalyst::Runtime as well!
 
-our $VERSION = '5.7013';
+our $VERSION = '5.80019';
+$VERSION = eval $VERSION;
 
 sub import {
     my ( $class, @arguments ) = @_;
@@ -89,13 +91,15 @@ sub import {
 
     my $caller = caller();
     return if $caller eq 'main';
-    my $meta = Moose::Meta::Class->initialize($caller);
-    #Moose->import({ into => $caller }); #do we want to do this?
 
+    my $meta = Moose::Meta::Class->initialize($caller);
     unless ( $caller->isa('Catalyst') ) {
         my @superclasses = ($meta->superclasses, $class, 'Catalyst::Controller');
         $meta->superclasses(@superclasses);
     }
+    # Avoid possible C3 issues if 'Moose::Object' is already on RHS of MyApp
+    $meta->superclasses(grep { $_ ne 'Moose::Object' } $meta->superclasses);
+
     unless( $meta->has_method('meta') ){
         $meta->add_method(meta => sub { Moose::Meta::Class->initialize("${caller}") } );
     }
@@ -104,15 +108,25 @@ sub import {
     $caller->setup_home;
 }
 
-#line 331
+sub _application { $_[0] }
+
+#line 367
 
 sub forward { my $c = shift; no warnings 'recursion'; $c->dispatcher->forward( $c, @_ ) }
 
-#line 346
+#line 382
 
 sub detach { my $c = shift; $c->dispatcher->detach( $c, @_ ) }
 
-#line 373
+#line 412
+
+sub visit { my $c = shift; $c->dispatcher->visit( $c, @_ ) }
+
+#line 430
+
+sub go { my $c = shift; $c->dispatcher->go( $c, @_ ) }
+
+#line 457
 
 around stash => sub {
     my $orig = shift;
@@ -130,7 +144,7 @@ around stash => sub {
 };
 
 
-#line 407
+#line 491
 
 sub error {
     my $c = shift;
@@ -144,152 +158,195 @@ sub error {
 }
 
 
-#line 434
+#line 520
 
 sub clear_errors {
     my $c = shift;
     $c->error(0);
 }
 
-
-# search via regex
-sub _comp_search {
-    my ( $c, @names ) = @_;
-
-    foreach my $name (@names) {
-        foreach my $component ( keys %{ $c->components } ) {
-            return $c->components->{$component} if $component =~ /$name/i;
-        }
-    }
-
-    return undef;
+sub _comp_search_prefixes {
+    my $c = shift;
+    return map $c->components->{ $_ }, $c->_comp_names_search_prefixes(@_);
 }
 
-# try explicit component names
-sub _comp_explicit {
-    my ( $c, @names ) = @_;
-
-    foreach my $try (@names) {
-        return $c->components->{$try} if ( exists $c->components->{$try} );
-    }
-
-    return undef;
-}
-
-# like component, but try just these prefixes before regex searching,
-#  and do not try to return "sort keys %{ $c->components }"
-sub _comp_prefixes {
+# search components given a name and some prefixes
+sub _comp_names_search_prefixes {
     my ( $c, $name, @prefixes ) = @_;
-
     my $appclass = ref $c || $c;
+    my $filter   = "^${appclass}::(" . join( '|', @prefixes ) . ')::';
+    $filter = qr/$filter/; # Compile regex now rather than once per loop
 
-    my @names = map { "${appclass}::${_}::${name}" } @prefixes;
+    # map the original component name to the sub part that we will search against
+    my %eligible = map { my $n = $_; $n =~ s{^$appclass\::[^:]+::}{}; $_ => $n; }
+        grep { /$filter/ } keys %{ $c->components };
 
-    my $comp = $c->_comp_explicit(@names);
-    return $comp if defined($comp);
-    $comp = $c->_comp_search($name);
-    return $comp;
+    # undef for a name will return all
+    return keys %eligible if !defined $name;
+
+    my $query  = ref $name ? $name : qr/^$name$/i;
+    my @result = grep { $eligible{$_} =~ m{$query} } keys %eligible;
+
+    return @result if @result;
+
+    # if we were given a regexp to search against, we're done.
+    return if ref $name;
+
+    # skip regexp fallback if configured
+    return
+        if $appclass->config->{disable_component_resolution_regex_fallback};
+
+    # regexp fallback
+    $query  = qr/$name/i;
+    @result = grep { $eligible{ $_ } =~ m{$query} } keys %eligible;
+
+    # no results? try against full names
+    if( !@result ) {
+        @result = grep { m{$query} } keys %eligible;
+    }
+
+    # don't warn if we didn't find any results, it just might not exist
+    if( @result ) {
+        # Disgusting hack to work out correct method name
+        my $warn_for = lc $prefixes[0];
+        my $msg = "Used regexp fallback for \$c->${warn_for}('${name}'), which found '" .
+           (join '", "', @result) . "'. Relying on regexp fallback behavior for " .
+           "component resolution is unreliable and unsafe.";
+        my $short = $result[0];
+        # remove the component namespace prefix
+        $short =~ s/.*?(Model|Controller|View):://;
+        my $shortmess = Carp::shortmess('');
+        if ($shortmess =~ m#Catalyst/Plugin#) {
+           $msg .= " You probably need to set '$short' instead of '${name}' in this " .
+              "plugin's config";
+        } elsif ($shortmess =~ m#Catalyst/lib/(View|Controller)#) {
+           $msg .= " You probably need to set '$short' instead of '${name}' in this " .
+              "component's config";
+        } else {
+           $msg .= " You probably meant \$c->${warn_for}('$short') instead of \$c->${warn_for}('${name}'), " .
+              "but if you really wanted to search, pass in a regexp as the argument " .
+              "like so: \$c->${warn_for}(qr/${name}/)";
+        }
+        $c->log->warn( "${msg}$shortmess" );
+    }
+
+    return @result;
 }
 
-# Find possible names for a prefix 
-
+# Find possible names for a prefix
 sub _comp_names {
     my ( $c, @prefixes ) = @_;
-
     my $appclass = ref $c || $c;
 
-    my @pre = map { "${appclass}::${_}::" } @prefixes;
+    my $filter = "^${appclass}::(" . join( '|', @prefixes ) . ')::';
 
-    my @names;
-
-    COMPONENT: foreach my $comp ($c->component) {
-        foreach my $p (@pre) {
-            if ($comp =~ s/^$p//) {
-                push(@names, $comp);
-                next COMPONENT;
-            }
-        }
-    }
+    my @names = map { s{$filter}{}; $_; }
+        $c->_comp_names_search_prefixes( undef, @prefixes );
 
     return @names;
-}
-
-# Return a component if only one matches.
-sub _comp_singular {
-    my ( $c, @prefixes ) = @_;
-
-    my $appclass = ref $c || $c;
-
-    my ( $comp, $rest ) =
-      map { $c->_comp_search("^${appclass}::${_}::") } @prefixes;
-    return $comp unless $rest;
 }
 
 # Filter a component before returning by calling ACCEPT_CONTEXT if available
 sub _filter_component {
     my ( $c, $comp, @args ) = @_;
+
     if ( eval { $comp->can('ACCEPT_CONTEXT'); } ) {
         return $comp->ACCEPT_CONTEXT( $c, @args );
     }
-    else { return $comp }
+
+    return $comp;
 }
 
-#line 535
+#line 636
 
 sub controller {
     my ( $c, $name, @args ) = @_;
-    return $c->_filter_component( $c->_comp_prefixes( $name, qw/Controller C/ ),
-        @args )
-      if ($name);
+
+    if( $name ) {
+        my @result = $c->_comp_search_prefixes( $name, qw/Controller C/ );
+        return map { $c->_filter_component( $_, @args ) } @result if ref $name;
+        return $c->_filter_component( $result[ 0 ], @args );
+    }
+
     return $c->component( $c->action->class );
 }
 
-#line 559
+#line 669
 
 sub model {
     my ( $c, $name, @args ) = @_;
-    return $c->_filter_component( $c->_comp_prefixes( $name, qw/Model M/ ),
-        @args )
-      if $name;
+    my $appclass = ref($c) || $c;
+    if( $name ) {
+        my @result = $c->_comp_search_prefixes( $name, qw/Model M/ );
+        return map { $c->_filter_component( $_, @args ) } @result if ref $name;
+        return $c->_filter_component( $result[ 0 ], @args );
+    }
+
     if (ref $c) {
-        return $c->stash->{current_model_instance} 
+        return $c->stash->{current_model_instance}
           if $c->stash->{current_model_instance};
         return $c->model( $c->stash->{current_model} )
           if $c->stash->{current_model};
     }
-    return $c->model( $c->config->{default_model} )
-      if $c->config->{default_model};
-    return $c->_filter_component( $c->_comp_singular(qw/Model M/) );
+    return $c->model( $appclass->config->{default_model} )
+      if $appclass->config->{default_model};
 
+    my( $comp, $rest ) = $c->_comp_search_prefixes( undef, qw/Model M/);
+
+    if( $rest ) {
+        $c->log->warn( Carp::shortmess('Calling $c->model() will return a random model unless you specify one of:') );
+        $c->log->warn( '* $c->config(default_model => "the name of the default model to use")' );
+        $c->log->warn( '* $c->stash->{current_model} # the name of the model to use for this request' );
+        $c->log->warn( '* $c->stash->{current_model_instance} # the instance of the model to use for this request' );
+        $c->log->warn( 'NB: in version 5.81, the "random" behavior will not work at all.' );
+    }
+
+    return $c->_filter_component( $comp );
 }
 
-#line 582
+
+#line 722
+
+sub view {
+    my ( $c, $name, @args ) = @_;
+
+    my $appclass = ref($c) || $c;
+    if( $name ) {
+        my @result = $c->_comp_search_prefixes( $name, qw/View V/ );
+        return map { $c->_filter_component( $_, @args ) } @result if ref $name;
+        return $c->_filter_component( $result[ 0 ], @args );
+    }
+
+    if (ref $c) {
+        return $c->stash->{current_view_instance}
+          if $c->stash->{current_view_instance};
+        return $c->view( $c->stash->{current_view} )
+          if $c->stash->{current_view};
+    }
+    return $c->view( $appclass->config->{default_view} )
+      if $appclass->config->{default_view};
+
+    my( $comp, $rest ) = $c->_comp_search_prefixes( undef, qw/View V/);
+
+    if( $rest ) {
+        $c->log->warn( 'Calling $c->view() will return a random view unless you specify one of:' );
+        $c->log->warn( '* $c->config(default_view => "the name of the default view to use")' );
+        $c->log->warn( '* $c->stash->{current_view} # the name of the view to use for this request' );
+        $c->log->warn( '* $c->stash->{current_view_instance} # the instance of the view to use for this request' );
+        $c->log->warn( 'NB: in version 5.81, the "random" behavior will not work at all.' );
+    }
+
+    return $c->_filter_component( $comp );
+}
+
+#line 760
 
 sub controllers {
     my ( $c ) = @_;
     return $c->_comp_names(qw/Controller C/);
 }
 
-
-#line 604
-
-sub view {
-    my ( $c, $name, @args ) = @_;
-    return $c->_filter_component( $c->_comp_prefixes( $name, qw/View V/ ),
-        @args )
-      if $name;
-    if (ref $c) {
-        return $c->stash->{current_view_instance} 
-          if $c->stash->{current_view_instance};
-        return $c->view( $c->stash->{current_view} )
-          if $c->stash->{current_view};
-    }
-    return $c->view( $c->config->{default_view} )
-      if $c->config->{default_view};
-    return $c->_filter_component( $c->_comp_singular(qw/View V/) );
-}
-
-#line 626
+#line 771
 
 sub models {
     my ( $c ) = @_;
@@ -297,59 +354,73 @@ sub models {
 }
 
 
-#line 638
+#line 783
 
 sub views {
     my ( $c ) = @_;
     return $c->_comp_names(qw/View V/);
 }
 
-#line 654
+#line 808
 
 sub component {
-    my $c = shift;
+    my ( $c, $name, @args ) = @_;
 
-    if (@_) {
+    if( $name ) {
+        my $comps = $c->components;
 
-        my $name = shift;
+        if( !ref $name ) {
+            # is it the exact name?
+            return $c->_filter_component( $comps->{ $name }, @args )
+                       if exists $comps->{ $name };
 
-        my $appclass = ref $c || $c;
+            # perhaps we just omitted "MyApp"?
+            my $composed = ( ref $c || $c ) . "::${name}";
+            return $c->_filter_component( $comps->{ $composed }, @args )
+                       if exists $comps->{ $composed };
 
-        my @names = (
-            $name, "${appclass}::${name}",
-            map { "${appclass}::${_}::${name}" }
-              qw/Model M Controller C View V/
-        );
+            # search all of the models, views and controllers
+            my( $comp ) = $c->_comp_search_prefixes( $name, qw/Model M Controller C View V/ );
+            return $c->_filter_component( $comp, @args ) if $comp;
+        }
 
-        my $comp = $c->_comp_explicit(@names);
-        return $c->_filter_component( $comp, @_ ) if defined($comp);
+        # This is here so $c->comp( '::M::' ) works
+        my $query = ref $name ? $name : qr{$name}i;
 
-        $comp = $c->_comp_search($name);
-        return $c->_filter_component( $comp, @_ ) if defined($comp);
+        my @result = grep { m{$query} } keys %{ $c->components };
+        return map { $c->_filter_component( $_, @args ) } @result if ref $name;
+
+        if( $result[ 0 ] ) {
+            $c->log->warn( Carp::shortmess(qq(Found results for "${name}" using regexp fallback)) );
+            $c->log->warn( 'Relying on the regexp fallback behavior for component resolution' );
+            $c->log->warn( 'is unreliable and unsafe. You have been warned' );
+            return $c->_filter_component( $result[ 0 ], @args );
+        }
+
+        # I would expect to return an empty list here, but that breaks back-compat
     }
 
+    # fallback
     return sort keys %{ $c->components };
 }
 
-
-
-#line 699
+#line 889
 
 around config => sub {
     my $orig = shift;
     my $c = shift;
 
-    $c->log->warn("Setting config after setup has been run is not a good idea.")
-      if ( @_ and $c->setup_finished );
+    croak('Setting config after setup has been run is not allowed.')
+        if ( @_ and $c->setup_finished );
 
     $c->$orig(@_);
 };
 
-#line 736
+#line 941
 
 sub debug { 0 }
 
-#line 762
+#line 967
 
 sub path_to {
     my ( $c, @path ) = @_;
@@ -358,10 +429,14 @@ sub path_to {
     else { return Path::Class::File->new( $c->config->{home}, @path ) }
 }
 
-#line 780
+#line 989
 
 sub plugin {
     my ( $class, $name, $plugin, @args ) = @_;
+
+    # See block comment in t/unit_core_plugin.t
+    $class->log->warn(qq/Adding plugin using the ->plugin method is deprecated, and will be removed in Catalyst 5.81/);
+
     $class->_register_plugin( $plugin, 1 );
 
     eval { $plugin->import };
@@ -379,12 +454,12 @@ sub plugin {
       if $class->debug;
 }
 
-#line 811
+#line 1024
 
 sub setup {
     my ( $class, @arguments ) = @_;
-    $class->log->warn("Running setup twice is not a good idea.")
-      if ( $class->setup_finished );
+    croak('Running setup more than once')
+        if ( $class->setup_finished );
 
     unless ( $class->isa('Catalyst') ) {
 
@@ -444,12 +519,13 @@ You are running an old script!
 
 EOF
     }
-    
+
     if ( $class->debug ) {
         my @plugins = map { "$_  " . ( $_->VERSION || '' ) } $class->registered_plugins;
 
         if (@plugins) {
-            my $t = Text::SimpleTable->new(74);
+            my $column_width = Catalyst::Utils::term_width() - 6;
+            my $t = Text::SimpleTable->new($column_width);
             $t->row($_) for @plugins;
             $class->log->debug( "Loaded plugins:\n" . $t->draw . "\n" );
         }
@@ -458,8 +534,8 @@ EOF
         my $engine     = $class->engine;
         my $home       = $class->config->{home};
 
-        $class->log->debug(qq/Loaded dispatcher "$dispatcher"/);
-        $class->log->debug(qq/Loaded engine "$engine"/);
+        $class->log->debug(sprintf(q/Loaded dispatcher "%s"/, blessed($dispatcher)));
+        $class->log->debug(sprintf(q/Loaded engine "%s"/, blessed($engine)));
 
         $home
           ? ( -d $home )
@@ -468,11 +544,12 @@ EOF
           : $class->log->debug(q/Couldn't find home/);
     }
 
-    # Call plugins setup
+    # Call plugins setup, this is stupid and evil.
+    # Also screws C3 badly on 5.10, hack to avoid.
     {
         no warnings qw/redefine/;
         local *setup = sub { };
-        $class->setup;
+        $class->setup unless $Catalyst::__AM_RESTARTING;
     }
 
     # Initialize our data structure
@@ -481,7 +558,8 @@ EOF
     $class->setup_components;
 
     if ( $class->debug ) {
-        my $t = Text::SimpleTable->new( [ 63, 'Class' ], [ 8, 'Type' ] );
+        my $column_width = Catalyst::Utils::term_width() - 8 - 9;
+        my $t = Text::SimpleTable->new( [ $column_width, 'Class' ], [ 8, 'Type' ] );
         for my $comp ( sort keys %{ $class->components } ) {
             my $type = ref $class->components->{$comp} ? 'instance' : 'class';
             $t->row( $comp, $type );
@@ -501,23 +579,59 @@ EOF
         my $name = $class->config->{name} || 'Application';
         $class->log->info("$name powered by Catalyst $Catalyst::VERSION");
     }
-    $class->log->_flush() if $class->log->can('_flush');
 
+    # Make sure that the application class becomes immutable at this point,
+    B::Hooks::EndOfScope::on_scope_end {
+        return if $@;
+        my $meta = Class::MOP::get_metaclass_by_name($class);
+        if (
+            $meta->is_immutable
+            && ! { $meta->immutable_options }->{replace_constructor}
+            && (
+                   $class->isa('Class::Accessor::Fast')
+                || $class->isa('Class::Accessor')
+            )
+        ) {
+            warn "You made your application class ($class) immutable, "
+                . "but did not inline the\nconstructor. "
+                . "This will break catalyst, as your app \@ISA "
+                . "Class::Accessor(::Fast)?\nPlease pass "
+                . "(replace_constructor => 1)\nwhen making your class immutable.\n";
+        }
+        $meta->make_immutable(
+            replace_constructor => 1,
+        ) unless $meta->is_immutable;
+    };
+
+    if ($class->config->{case_sensitive}) {
+        $class->log->warn($class . "->config->{case_sensitive} is set.");
+        $class->log->warn("This setting is deprecated and planned to be removed in Catalyst 5.81.");
+    }
+
+    $class->setup_finalize;
+    # Should be the last thing we do so that user things hooking
+    # setup_finalize can log..
+    $class->log->_flush() if $class->log->can('_flush');
+    return 1; # Explicit return true as people have __PACKAGE__->setup as the last thing in their class. HATE.
+}
+
+
+#line 1203
+
+sub setup_finalize {
+    my ($class) = @_;
     $class->setup_finished(1);
 }
 
-#line 956
+#line 1251
 
 sub uri_for {
     my ( $c, $path, @args ) = @_;
 
-    if ( Scalar::Util::blessed($path) ) { # action object
-        my $captures = ( scalar @args && ref $args[0] eq 'ARRAY'
-                         ? shift(@args)
-                         : [] );
-        $path = $c->dispatcher->uri_for_action($path, $captures);
-        return undef unless defined($path);
-        $path = '/' if $path eq '';
+    if (blessed($path) && $path->isa('Catalyst::Controller')) {
+        $path = $path->path_prefix;
+        $path =~ s{/+\z}{};
+        $path .= '/';
     }
 
     undef($path) if (defined $path && $path eq '');
@@ -527,6 +641,24 @@ sub uri_for {
 
     carp "uri_for called with undef argument" if grep { ! defined $_ } @args;
     s/([^$URI::uric])/$URI::Escape::escapes{$1}/go for @args;
+    if (blessed $path) { # Action object only.
+        s|/|%2F|g for @args;
+    }
+
+    if ( blessed($path) ) { # action object
+        my $captures = [ map { s|/|%2F|g; $_; }
+                        ( scalar @args && ref $args[0] eq 'ARRAY'
+                         ? @{ shift(@args) }
+                         : ()) ];
+        my $action = $path;
+        $path = $c->dispatcher->uri_for_action($action, $captures);
+        if (not defined $path) {
+            $c->log->debug(qq/Can't find uri_for action '$action' @$captures/)
+                if $c->debug;
+            return undef;
+        }
+        $path = '/' if $path eq '';
+    }
 
     unshift(@args, $path);
 
@@ -537,11 +669,11 @@ sub uri_for {
         }
         unshift(@args, $namespace || '');
     }
-    
+
     # join args with '/', or a blank string
     my $args = join('/', grep { defined($_) } @args);
     $args =~ s/\?/%3F/g; # STUPID STUPID SPECIAL CASE
-    $args =~ s!^/!!;
+    $args =~ s!^/+!!;
     my $base = $c->req->base;
     my $class = ref($base);
     $base =~ s{(?<!/)$}{/};
@@ -551,18 +683,18 @@ sub uri_for {
     if (my @keys = keys %$params) {
       # somewhat lifted from URI::_query's query_form
       $query = '?'.join('&', map {
+          my $val = $params->{$_};
           s/([;\/?:@&=+,\$\[\]%])/$URI::Escape::escapes{$1}/go;
           s/ /+/g;
           my $key = $_;
-          my $val = $params->{$_};
           $val = '' unless defined $val;
           (map {
-              $_ = "$_";
-              utf8::encode( $_ ) if utf8::is_utf8($_);
+              my $param = "$_";
+              utf8::encode( $param ) if utf8::is_utf8($param);
               # using the URI::Escape pattern here so utf8 chars survive
-              s/([^A-Za-z0-9\-_.!~*'() ])/$URI::Escape::escapes{$1}/go;
-              s/ /+/g;
-              "${key}=$_"; } ( ref $val eq 'ARRAY' ? @$val : $val ));
+              $param =~ s/([^A-Za-z0-9\-_.!~*'() ])/$URI::Escape::escapes{$1}/go;
+              $param =~ s/ /+/g;
+              "${key}=$param"; } ( ref $val eq 'ARRAY' ? @$val : $val ));
       } @keys);
     }
 
@@ -570,7 +702,20 @@ sub uri_for {
     $res;
 }
 
-#line 1024
+#line 1363
+
+sub uri_for_action {
+    my ( $c, $path, @args ) = @_;
+    my $action = blessed($path)
+      ? $path
+      : $c->dispatcher->get_action_by_path($path);
+    unless (defined $action) {
+      croak "Can't find action for path '$path'";
+    }
+    return $c->uri_for( $action, @args );
+}
+
+#line 1380
 
 sub welcome_message {
     my $c      = shift;
@@ -669,7 +814,7 @@ sub welcome_message {
                  <p>That really depends  on what <b>you</b> want to do.
                     We do, however, provide you with a few starting points.</p>
                  <p>If you want to jump right into web development with Catalyst
-                    you might want want to start with a tutorial.</p>
+                    you might want to start with a tutorial.</p>
 <pre>perldoc <a href="http://cpansearch.perl.org/dist/Catalyst-Manual/lib/Catalyst/Manual/Tutorial.pod">Catalyst::Manual::Tutorial</a></code>
 </pre>
 <p>Afterwards you can go on to check out a more complete look at our features.</p>
@@ -685,7 +830,7 @@ sub welcome_message {
                     they can save you a lot of work.</p>
                     <pre><code>script/${prefix}_create.pl -help</code></pre>
                     <p>Also, be sure to check out the vast and growing
-                    collection of <a href="http://cpansearch.perl.org/search?query=Catalyst%3A%3APlugin%3A%3A&amp;mode=all">plugins for Catalyst on CPAN</a>;
+                    collection of <a href="http://search.cpan.org/search?query=Catalyst">plugins for Catalyst on CPAN</a>;
                     you are likely to find what you need there.
                     </p>
 
@@ -697,14 +842,14 @@ sub welcome_message {
                          <a href="http://dev.catalyst.perl.org">Wiki</a>
                      </li>
                      <li>
-                         <a href="http://lists.rawmode.org/mailman/listinfo/catalyst">Mailing-List</a>
+                         <a href="http://lists.scsys.co.uk/cgi-bin/mailman/listinfo/catalyst">Mailing-List</a>
                      </li>
                      <li>
                          <a href="irc://irc.perl.org/catalyst">IRC channel #catalyst on irc.perl.org</a>
                      </li>
                  </ul>
                  <h2>In conclusion</h2>
-                 <p>The Catalyst team hopes you will enjoy using Catalyst as much 
+                 <p>The Catalyst team hopes you will enjoy using Catalyst as much
                     as we enjoyed making it. Please contact us if you have ideas
                     for improvement or other feedback.</p>
              </div>
@@ -714,21 +859,21 @@ sub welcome_message {
 EOF
 }
 
-#line 1193
+#line 1549
 
 sub dispatch { my $c = shift; $c->dispatcher->dispatch( $c, @_ ) }
 
-#line 1206
+#line 1562
 
 sub dump_these {
     my $c = shift;
-    [ Request => $c->req ], 
-    [ Response => $c->res ], 
+    [ Request => $c->req ],
+    [ Response => $c->res ],
     [ Stash => $c->stash ],
     [ Config => $c->config ];
 }
 
-#line 1225
+#line 1581
 
 sub execute {
     my ( $c, $class, $code ) = @_;
@@ -748,15 +893,21 @@ sub execute {
     my $stats_info = $c->_stats_start_execute( $code ) if $c->use_stats;
 
     push( @{ $c->stack }, $code );
-    
+
+    no warnings 'recursion';
     eval { $c->state( $code->execute( $class, $c, @{ $c->req->args } ) || 0 ) };
 
     $c->_stats_finish_execute( $stats_info ) if $c->use_stats and $stats_info;
-    
+
     my $last = pop( @{ $c->stack } );
 
     if ( my $error = $@ ) {
-        if ( !ref($error) and $error eq $DETACH ) { die $DETACH if $c->depth > 1 }
+        if ( blessed($error) and $error->isa('Catalyst::Exception::Detach') ) {
+            $error->rethrow if $c->depth > 1;
+        }
+        elsif ( blessed($error) and $error->isa('Catalyst::Exception::Go') ) {
+            $error->rethrow if $c->depth > 0;
+        }
         else {
             unless ( ref $error ) {
                 no warnings 'uninitialized';
@@ -774,9 +925,9 @@ sub execute {
 
 sub _stats_start_execute {
     my ( $c, $code ) = @_;
-
+    my $appclass = ref($c) || $c;
     return if ( ( $code->name =~ /^_.*/ )
-        && ( !$c->config->{show_internal_actions} ) );
+        && ( !$appclass->config->{show_internal_actions} ) );
 
     my $action_name = $code->reverse();
     $c->counter->{$action_name}++;
@@ -804,11 +955,12 @@ sub _stats_start_execute {
 
     # is this a root-level call or a forwarded call?
     if ( $callsub =~ /forward$/ ) {
+        my $parent = $c->stack->[-1];
 
         # forward, locate the caller
-        if ( my $parent = $c->stack->[-1] ) {
+        if ( exists $c->counter->{"$parent"} ) {
             $c->stats->profile(
-                begin  => $action, 
+                begin  => $action,
                 parent => "$parent" . $c->counter->{"$parent"},
                 uid    => $uid,
             );
@@ -823,7 +975,7 @@ sub _stats_start_execute {
         }
     }
     else {
-        
+
         # root-level call
         $c->stats->profile(
             begin => $action,
@@ -839,24 +991,7 @@ sub _stats_finish_execute {
     $c->stats->profile( end => $info );
 }
 
-#line 1338
-
-#Why does this exist? This is no longer safe and WILL NOT WORK.
-# it doesnt seem to be used anywhere. can we remove it?
-sub _localize_fields {
-    my ( $c, $localized, $code ) = ( @_ );
-
-    my $request = delete $localized->{request} || {};
-    my $response = delete $localized->{response} || {};
-    
-    local @{ $c }{ keys %$localized } = values %$localized;
-    local @{ $c->request }{ keys %$request } = values %$request;
-    local @{ $c->response }{ keys %$response } = values %$response;
-
-    $code->();
-}
-
-#line 1359
+#line 1703
 
 sub finalize {
     my $c = shift;
@@ -888,30 +1023,30 @@ sub finalize {
 
         $c->finalize_body;
     }
-    
-    if ($c->use_stats) {        
+
+    if ($c->use_stats) {
         my $elapsed = sprintf '%f', $c->stats->elapsed;
         my $av = $elapsed == 0 ? '??' : sprintf '%.3f', 1 / $elapsed;
         $c->log->info(
-            "Request took ${elapsed}s ($av/s)\n" . $c->stats->report . "\n" );        
+            "Request took ${elapsed}s ($av/s)\n" . $c->stats->report . "\n" );
     }
 
     return $c->response->status;
 }
 
-#line 1406
+#line 1750
 
 sub finalize_body { my $c = shift; $c->engine->finalize_body( $c, @_ ) }
 
-#line 1414
+#line 1758
 
 sub finalize_cookies { my $c = shift; $c->engine->finalize_cookies( $c, @_ ) }
 
-#line 1422
+#line 1766
 
 sub finalize_error { my $c = shift; $c->engine->finalize_error( $c, @_ ) }
 
-#line 1430
+#line 1774
 
 sub finalize_headers {
     my $c = shift;
@@ -926,8 +1061,7 @@ sub finalize_headers {
         $c->log->debug(qq/Redirecting to "$location"/) if $c->debug;
         $response->header( Location => $location );
 
-        #Moose TODO: we should probably be using a predicate method here ?
-        if ( !$response->body ) {
+        if ( !$response->has_body ) {
             # Add a default body if none is already present
             $response->body(
                 qq{<html><body><p>This item has moved <a href="$location">here</a>.</p></body></html>}
@@ -951,7 +1085,7 @@ sub finalize_headers {
         }
         else {
             # everything should be bytes at this point, but just in case
-            $response->content_length( bytes::length( $response->body ) );
+            $response->content_length( length( $response->body ) );
         }
     }
 
@@ -969,23 +1103,23 @@ sub finalize_headers {
     $response->finalized_headers(1);
 }
 
-#line 1496
+#line 1839
 
 sub finalize_read { my $c = shift; $c->engine->finalize_read( $c, @_ ) }
 
-#line 1504
+#line 1847
 
 sub finalize_uploads { my $c = shift; $c->engine->finalize_uploads( $c, @_ ) }
 
-#line 1512
+#line 1855
 
 sub get_action { my $c = shift; $c->dispatcher->get_action(@_) }
 
-#line 1521
+#line 1864
 
 sub get_actions { my $c = shift; $c->dispatcher->get_actions( $c, @_ ) }
 
-#line 1529
+#line 1872
 
 sub handle_request {
     my ( $class, @arguments ) = @_;
@@ -1002,7 +1136,7 @@ sub handle_request {
 
         my $c = $class->prepare(@arguments);
         $c->dispatch;
-        $status = $c->finalize;   
+        $status = $c->finalize;
     };
 
     if ( my $error = $@ ) {
@@ -1011,14 +1145,14 @@ sub handle_request {
     }
 
     $COUNT++;
-    
+
     if(my $coderef = $class->log->can('_flush')){
         $class->log->$coderef();
     }
     return $status;
 }
 
-#line 1567
+#line 1910
 
 sub prepare {
     my ( $class, @arguments ) = @_;
@@ -1027,7 +1161,7 @@ sub prepare {
     # After the app/ctxt split, this should become an attribute based on something passed
     # into the application.
     $class->context_class( ref $class || $class ) unless $class->context_class;
-   
+
     my $c = $class->context_class->new({});
 
     # For on-demand data
@@ -1037,7 +1171,7 @@ sub prepare {
     #surely this is not the most efficient way to do things...
     $c->stats($class->stats_class->new)->enable($c->use_stats);
     if ( $c->debug ) {
-        $c->res->headers->header( 'X-Catalyst' => $Catalyst::VERSION );            
+        $c->res->headers->header( 'X-Catalyst' => $Catalyst::VERSION );
     }
 
     #XXX reuse coderef from can
@@ -1056,15 +1190,16 @@ sub prepare {
         # Prepare the body for reading, either by prepare_body
         # or the user, if they are using $c->read
         $c->prepare_read;
-        
+
         # Parse the body unless the user wants it on-demand
-        unless ( $c->config->{parse_on_demand} ) {
+        unless ( ref($c)->config->{parse_on_demand} ) {
             $c->prepare_body;
         }
     }
 
     my $method  = $c->req->method  || '';
-    my $path    = $c->req->path    || '/';
+    my $path    = $c->req->path;
+    $path       = '/' unless length $path;
     my $address = $c->req->address || '';
 
     $c->log->debug(qq/"$method" request for "$path" from "$address"/)
@@ -1075,18 +1210,16 @@ sub prepare {
     return $c;
 }
 
-#line 1628
+#line 1972
 
 sub prepare_action { my $c = shift; $c->dispatcher->prepare_action( $c, @_ ) }
 
-#line 1636
+#line 1980
 
 sub prepare_body {
     my $c = shift;
 
-    #Moose TODO: what is  _body ??
-    # Do we run for the first time?
-    return if defined $c->request->{_body};
+    return if $c->request->_has_body;
 
     # Initialize on-demand data
     $c->engine->prepare_body( $c, @_ );
@@ -1105,36 +1238,36 @@ sub prepare_body {
     }
 }
 
-#line 1668
+#line 2010
 
 sub prepare_body_chunk {
     my $c = shift;
     $c->engine->prepare_body_chunk( $c, @_ );
 }
 
-#line 1679
+#line 2021
 
 sub prepare_body_parameters {
     my $c = shift;
     $c->engine->prepare_body_parameters( $c, @_ );
 }
 
-#line 1690
+#line 2032
 
 sub prepare_connection {
     my $c = shift;
     $c->engine->prepare_connection( $c, @_ );
 }
 
-#line 1701
+#line 2043
 
 sub prepare_cookies { my $c = shift; $c->engine->prepare_cookies( $c, @_ ) }
 
-#line 1709
+#line 2051
 
 sub prepare_headers { my $c = shift; $c->engine->prepare_headers( $c, @_ ) }
 
-#line 1717
+#line 2059
 
 sub prepare_parameters {
     my $c = shift;
@@ -1142,11 +1275,11 @@ sub prepare_parameters {
     $c->engine->prepare_parameters( $c, @_ );
 }
 
-#line 1729
+#line 2071
 
 sub prepare_path { my $c = shift; $c->engine->prepare_path( $c, @_ ) }
 
-#line 1737
+#line 2079
 
 sub prepare_query_parameters {
     my $c = shift;
@@ -1165,15 +1298,15 @@ sub prepare_query_parameters {
     }
 }
 
-#line 1760
+#line 2102
 
 sub prepare_read { my $c = shift; $c->engine->prepare_read( $c, @_ ) }
 
-#line 1768
+#line 2110
 
 sub prepare_request { my $c = shift; $c->engine->prepare_request( $c, @_ ) }
 
-#line 1776
+#line 2118
 
 sub prepare_uploads {
     my $c = shift;
@@ -1197,45 +1330,42 @@ sub prepare_uploads {
     }
 }
 
-#line 1804
+#line 2146
 
 sub prepare_write { my $c = shift; $c->engine->prepare_write( $c, @_ ) }
 
-#line 1829
+#line 2171
 
 sub read { my $c = shift; return $c->engine->read( $c, @_ ) }
 
-#line 1837
+#line 2179
 
 sub run { my $c = shift; return $c->engine->run( $c, @_ ) }
 
-#line 1845
+#line 2187
 
 sub set_action { my $c = shift; $c->dispatcher->set_action( $c, @_ ) }
 
-#line 1853
+#line 2195
 
 sub setup_actions { my $c = shift; $c->dispatcher->setup_actions( $c, @_ ) }
 
-#line 1865
+#line 2212
 
 sub setup_components {
     my $class = shift;
 
-    my @paths   = qw( ::Controller ::C ::Model ::M ::View ::V );
     my $config  = $class->config->{ setup_components };
-    my $extra   = delete $config->{ search_extra } || [];
-    
-    push @paths, @$extra;
-        
-    my $locator = Module::Pluggable::Object->new(
-        search_path => [ map { s/^(?=::)/$class/; $_; } @paths ],
-        %$config
-    );
 
-    my @comps = sort { length $a <=> length $b } $locator->plugins;
+    my @comps = sort { length $a <=> length $b }
+                $class->locate_components($config);
     my %comps = map { $_ => 1 } @comps;
-    
+
+    my $deprecatedcatalyst_component_names = grep { /::[CMV]::/ } @comps;
+    $class->log->warn(qq{Your application is using the deprecated ::[MVC]:: type naming scheme.\n}.
+        qq{Please switch your class names to ::Model::, ::View:: and ::Controller: as appropriate.\n}
+    ) if $deprecatedcatalyst_component_names;
+
     for my $component ( @comps ) {
 
         # We pass ignore_loaded here so that overlay files for (e.g.)
@@ -1243,25 +1373,64 @@ sub setup_components {
         # we know M::P::O found a file on disk so this is safe
 
         Catalyst::Utils::ensure_class_loaded( $component, { ignore_loaded => 1 } );
-        #Class::MOP::load_class($component);
 
-        my $module  = $class->setup_component( $component );
-        my %modules = (
-            $component => $module,
-            map {
-                $_ => $class->setup_component( $_ )
-            } grep { 
-              not exists $comps{$_}
-            } Devel::InnerPackage::list_packages( $component )
-        );
-        
-        for my $key ( keys %modules ) {
-            $class->components->{ $key } = $modules{ $key };
+        # Needs to be done as soon as the component is loaded, as loading a sub-component
+        # (next time round the loop) can cause us to get the wrong metaclass..
+        $class->_controller_init_base_classes($component);
+    }
+
+    for my $component (@comps) {
+        $class->components->{ $component } = $class->setup_component($component);
+        for my $component ($class->expand_component_module( $component, $config )) {
+            next if $comps{$component};
+            $class->_controller_init_base_classes($component); # Also cover inner packages
+            $class->components->{ $component } = $class->setup_component($component);
         }
     }
 }
 
-#line 1911
+#line 2261
+
+sub locate_components {
+    my $class  = shift;
+    my $config = shift;
+
+    my @paths   = qw( ::Controller ::C ::Model ::M ::View ::V );
+    my $extra   = delete $config->{ search_extra } || [];
+
+    push @paths, @$extra;
+
+    my $locator = Module::Pluggable::Object->new(
+        search_path => [ map { s/^(?=::)/$class/; $_; } @paths ],
+        %$config
+    );
+
+    my @comps = $locator->plugins;
+
+    return @comps;
+}
+
+#line 2287
+
+sub expand_component_module {
+    my ($class, $module) = @_;
+    return Devel::InnerPackage::list_packages( $module );
+}
+
+#line 2296
+
+# FIXME - Ugly, ugly hack to ensure the we force initialize non-moose base classes
+#         nearest to Catalyst::Controller first, no matter what order stuff happens
+#         to be loaded. There are TODO tests in Moose for this, see
+#         f2391d17574eff81d911b97be15ea51080500003
+sub _controller_init_base_classes {
+    my ($app_class, $component) = @_;
+    return unless $component->isa('Catalyst::Controller');
+    foreach my $class ( reverse @{ mro::get_linear_isa($component) } ) {
+        Moose::Meta::Class->initialize( $class )
+            unless find_meta($class);
+    }
+}
 
 sub setup_component {
     my( $class, $component ) = @_;
@@ -1272,6 +1441,10 @@ sub setup_component {
 
     my $suffix = Catalyst::Utils::class2classsuffix( $component );
     my $config = $class->config->{ $suffix } || {};
+    # Stash catalyst_component_name in the config here, so that custom COMPONENT
+    # methods also pass it. local to avoid pointlessly shitting in config
+    # for the debug screen, as $component is already the key name.
+    local $config->{catalyst_component_name} = $component;
 
     my $instance = eval { $component->COMPONENT( $class, $config ); };
 
@@ -1282,15 +1455,20 @@ sub setup_component {
         );
     }
 
-    Catalyst::Exception->throw(
-        message =>
-        qq/Couldn't instantiate component "$component", "COMPONENT() didn't return an object-like value"/
-    ) unless blessed($instance);
-
+    unless (blessed $instance) {
+        my $metaclass = Moose::Util::find_meta($component);
+        my $method_meta = $metaclass->find_method_by_name('COMPONENT');
+        my $component_method_from = $method_meta->associated_metaclass->name;
+        my $value = defined($instance) ? $instance : 'undef';
+        Catalyst::Exception->throw(
+            message =>
+            qq/Couldn't instantiate component "$component", COMPONENT() method (from $component_method_from) didn't return an object-like value (value was $value)./
+        );
+    }
     return $instance;
 }
 
-#line 1944
+#line 2351
 
 sub setup_dispatcher {
     my ( $class, $dispatcher ) = @_;
@@ -1313,7 +1491,7 @@ sub setup_dispatcher {
     $class->dispatcher( $dispatcher->new );
 }
 
-#line 1971
+#line 2378
 
 sub setup_engine {
     my ( $class, $engine ) = @_;
@@ -1327,9 +1505,10 @@ sub setup_engine {
     }
 
     if ( $ENV{MOD_PERL} ) {
+        my $meta = Class::MOP::get_metaclass_by_name($class);
 
         # create the apache method
-        $class->meta->add_method('apache' => sub { shift->engine->apache });
+        $meta->add_method('apache' => sub { shift->engine->apache });
 
         my ( $software, $version ) =
           $ENV{MOD_PERL} =~ /^(\S+)\/(\d+(?:[\.\_]\d+)+)/;
@@ -1387,9 +1566,6 @@ sub setup_engine {
     }
 
     Class::MOP::load_class($engine);
-    #unless (Class::Inspector->loaded($engine)) {
-    #    require Class::Inspector->filename($engine);
-    #}
 
     # check for old engines that are no longer compatible
     my $old_engine;
@@ -1427,7 +1603,7 @@ sub setup_engine {
     $class->engine( $engine->new );
 }
 
-#line 2089
+#line 2494
 
 sub setup_home {
     my ( $class, $home ) = @_;
@@ -1445,25 +1621,35 @@ sub setup_home {
     }
 }
 
-#line 2111
+#line 2526
 
 sub setup_log {
-    my ( $class, $debug ) = @_;
+    my ( $class, $levels ) = @_;
 
-    unless ( $class->log ) {
-        $class->log( Catalyst::Log->new );
-    }
+    $levels ||= '';
+    $levels =~ s/^\s+//;
+    $levels =~ s/\s+$//;
+    my %levels = map { $_ => 1 } split /\s*,\s*/, $levels;
 
     my $env_debug = Catalyst::Utils::env_value( $class, 'DEBUG' );
-    if ( defined($env_debug) ? $env_debug : $debug ) {
-        $class->meta->add_method('debug' => sub { 1 });
+    if ( defined $env_debug ) {
+        $levels{debug} = 1 if $env_debug; # Ugly!
+        delete($levels{debug}) unless $env_debug;
+    }
+
+    unless ( $class->log ) {
+        $class->log( Catalyst::Log->new(keys %levels) );
+    }
+
+    if ( $levels{debug} ) {
+        Class::MOP::get_metaclass_by_name($class)->add_method('debug' => sub { 1 });
         $class->log->debug('Debug messages enabled');
     }
 }
 
-#line 2131
+#line 2556
 
-#line 2137
+#line 2562
 
 sub setup_stats {
     my ( $class, $stats ) = @_;
@@ -1472,13 +1658,13 @@ sub setup_stats {
 
     my $env = Catalyst::Utils::env_value( $class, 'STATS' );
     if ( defined($env) ? $env : ($stats || $class->debug ) ) {
-        $class->meta->add_method('use_stats' => sub { 1 });
+        Class::MOP::get_metaclass_by_name($class)->add_method('use_stats' => sub { 1 });
         $class->log->debug('Statistics enabled');
     }
 }
 
 
-#line 2165
+#line 2590
 
 {
 
@@ -1494,17 +1680,15 @@ sub setup_stats {
         my ( $proto, $plugin, $instant ) = @_;
         my $class = ref $proto || $proto;
 
-        # no ignore_loaded here, the plugin may already have been
-        # defined in memory and we don't want to error on "no file" if so
-
         Class::MOP::load_class( $plugin );
-
+        $class->log->warn( "$plugin inherits from 'Catalyst::Component' - this is decated and will not work in 5.81" )
+            if $plugin->isa( 'Catalyst::Component' );
         $proto->_plugins->{$plugin} = 1;
         unless ($instant) {
             no strict 'refs';
-            if( $class->can('meta') ){
-              my @superclasses = ($plugin, $class->meta->superclasses );
-              $class->meta->superclasses(@superclasses);
+            if ( my $meta = Class::MOP::get_metaclass_by_name($class) ) {
+              my @superclasses = ($plugin, $meta->superclasses );
+              $meta->superclasses(@superclasses);
             } else {
               unshift @{"$class\::ISA"}, $plugin;
             }
@@ -1517,23 +1701,35 @@ sub setup_stats {
 
         $class->_plugins( {} ) unless $class->_plugins;
         $plugins ||= [];
-        for my $plugin ( reverse @$plugins ) {
 
-            unless ( $plugin =~ s/\A\+// ) {
-                $plugin = "Catalyst::Plugin::$plugin";
-            }
+        my @plugins = Catalyst::Utils::resolve_namespace($class . '::Plugin', 'Catalyst::Plugin', @$plugins);
+
+        for my $plugin ( reverse @plugins ) {
+            Class::MOP::load_class($plugin);
+            my $meta = find_meta($plugin);
+            next if $meta && $meta->isa('Moose::Meta::Role');
 
             $class->_register_plugin($plugin);
         }
+
+        my @roles =
+            map { $_->name }
+            grep { $_ && blessed($_) && $_->isa('Moose::Meta::Role') }
+            map { find_meta($_) }
+            @plugins;
+
+        Moose::Util::apply_all_roles(
+            $class => @roles
+        ) if @roles;
     }
 }
 
-#line 2233
+#line 2668
 
 sub use_stats { 0 }
 
 
-#line 2244
+#line 2679
 
 sub write {
     my $c = shift;
@@ -1544,12 +1740,14 @@ sub write {
     return $c->engine->write( $c, @_ );
 }
 
-#line 2260
+#line 2695
 
 sub version { return $Catalyst::VERSION }
 
-#line 2448
+#line 3009
 
 no Moose;
+
+__PACKAGE__->meta->make_immutable;
 
 1;

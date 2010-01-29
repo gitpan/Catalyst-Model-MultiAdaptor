@@ -8,7 +8,7 @@ use Sub::Install;
 use Module::Pluggable::Object;
 use Catalyst::Model::MultiAdaptor::LifeCycle;
 
-use parent 'Catalyst::Model';
+use base 'Catalyst::Model';
 
 sub load_services {
     my $self         = shift;

@@ -1,14 +1,18 @@
 #line 1
 package Catalyst::Controller;
 
-#switch to BEGIN { extends qw/ ... /; } ?
-use base qw/Catalyst::Component Catalyst::AttrContainer/;
 use Moose;
+use Moose::Util qw/find_meta/;
+use List::MoreUtils qw/uniq/;
+use namespace::clean -except => 'meta';
 
-use Scalar::Util qw/blessed/;
+BEGIN { extends qw/Catalyst::Component MooseX::MethodAttributes::Inheritable/; }
+
+use MooseX::MethodAttributes;
 use Catalyst::Exception;
 use Catalyst::Utils;
-use Class::Inspector;
+
+with 'Catalyst::Component::ApplicationAttribute';
 
 has path_prefix =>
     (
@@ -28,24 +32,22 @@ has action_namespace =>
 
 has actions =>
     (
-     is => 'rw',
+     accessor => '_controller_actions',
      isa => 'HashRef',
      init_arg => undef,
     );
-
-# isa => 'ClassName|Catalyst' ?
-has _application => (is => 'rw');
-sub _app{ shift->_application(@_) } 
 
 sub BUILD {
     my ($self, $args) = @_;
     my $action  = delete $args->{action}  || {};
     my $actions = delete $args->{actions} || {};
     my $attr_value = $self->merge_config_hashes($actions, $action);
-    $self->actions($attr_value);
+    $self->_controller_actions($attr_value);
 }
 
-#line 68
+
+
+#line 70
 
 #I think both of these could be attributes. doesn't really seem like they need
 #to ble class data. i think that attributes +default would work just fine
@@ -87,7 +89,7 @@ sub _ACTION : Private {
     my ( $self, $c ) = @_;
     if (   ref $c->action
         && $c->action->can('execute')
-        && $c->req->action )
+        && defined $c->req->action )
     {
         $c->action->dispatch( $c );
     }
@@ -102,50 +104,43 @@ sub _END : Private {
     return !@{ $c->error };
 }
 
-around new => sub {
-    my $orig = shift;
-    my $self = shift;
-    my $app = $_[0];
-    my $new = $self->$orig(@_);
-    $new->_application( $app );
-    return $new;
-};
-
 sub action_for {
     my ( $self, $name ) = @_;
     my $app = ($self->isa('Catalyst') ? $self : $self->_application);
     return $app->dispatcher->get_action($name, $self->action_namespace);
 }
 
-#my opinion is that this whole sub really should be a builder method, not 
+#my opinion is that this whole sub really should be a builder method, not
 #something that happens on every call. Anyone else disagree?? -- groditi
 ## -- apparently this is all just waiting for app/ctx split
 around action_namespace => sub {
     my $orig = shift;
     my ( $self, $c ) = @_;
 
+    my $class = ref($self) || $self;
+    my $appclass = ref($c) || $c;
     if( ref($self) ){
         return $self->$orig if $self->has_action_namespace;
     } else {
-        return $self->config->{namespace} if exists $self->config->{namespace};
+        return $class->config->{namespace} if exists $class->config->{namespace};
     }
 
     my $case_s;
     if( $c ){
-        $case_s = $c->config->{case_sensitive};
+        $case_s = $appclass->config->{case_sensitive};
     } else {
         if ($self->isa('Catalyst')) {
-            $case_s = $self->config->{case_sensitive};
+            $case_s = $class->config->{case_sensitive};
         } else {
             if (ref $self) {
-                $case_s = $self->_application->config->{case_sensitive};
+                $case_s = ref($self->_application)->config->{case_sensitive};
             } else {
                 confess("Can't figure out case_sensitive setting");
             }
         }
     }
 
-    my $namespace = Catalyst::Utils::class2prefix(ref($self) || $self, $case_s) || '';
+    my $namespace = Catalyst::Utils::class2prefix($self->catalyst_component_name, $case_s) || '';
     $self->$orig($namespace) if ref($self);
     return $namespace;
 };
@@ -164,43 +159,65 @@ around path_prefix => sub {
     return $namespace;
 };
 
+sub get_action_methods {
+    my $self = shift;
+    my $meta = find_meta($self) || confess("No metaclass setup for $self");
+    confess("Metaclass "
+          . ref($meta) . " for "
+          . $meta->name
+          . " cannot support register_actions." )
+      unless $meta->can('get_nearest_methods_with_attributes');
+    my @methods = $meta->get_nearest_methods_with_attributes;
+
+    # actions specified via config are also action_methods
+    push(
+        @methods,
+        map {
+            $meta->find_method_by_name($_)
+              || confess( 'Action "'
+                  . $_
+                  . '" is not available from controller '
+                  . ( ref $self ) )
+          } keys %{ $self->_controller_actions }
+    ) if ( ref $self );
+    return uniq @methods;
+}
+
 
 sub register_actions {
     my ( $self, $c ) = @_;
-    my $class = ref $self || $self;
+    $self->register_action_methods( $c, $self->get_action_methods );
+}
+
+sub register_action_methods {
+    my ( $self, $c, @methods ) = @_;
+    my $class = $self->catalyst_component_name;
     #this is still not correct for some reason.
     my $namespace = $self->action_namespace($c);
-    my $meta = $self->meta;
-    my %methods = map{ $_->{code}->body => $_->{name} }
-        grep {$_->{class} ne 'Moose::Object'} #ignore Moose::Object methods
-            $meta->compute_all_applicable_methods;
 
-
-    # Advanced inheritance support for plugins and the like
-    #moose todo: migrate to eliminate CDI compat
-    my @action_cache;
-    for my $isa ( $meta->superclasses, $class ) {
-        if(my $coderef = $isa->can('_action_cache')){
-            push(@action_cache, @{ $isa->$coderef });
+    # FIXME - fugly
+    if (!blessed($self) && $self eq $c && scalar(@methods)) {
+        my @really_bad_methods = grep { ! /^_(DISPATCH|BEGIN|AUTO|ACTION|END)$/ } map { $_->name } @methods;
+        if (scalar(@really_bad_methods)) {
+            $c->log->warn("Action methods (" . join(', ', @really_bad_methods) . ") found defined in your application class, $self. This is deprecated, please move them into a Root controller.");
         }
     }
 
-    foreach my $cache (@action_cache) {
-        my $code   = $cache->[0];
-        my $method = delete $methods{$code}; # avoid dupe registers
-        next unless $method;
-        my $attrs = $self->_parse_attrs( $c, $method, @{ $cache->[1] } );
+    foreach my $method (@methods) {
+        my $name = $method->name;
+        my $attributes = $method->attributes;
+        my $attrs = $self->_parse_attrs( $c, $name, @{ $attributes } );
         if ( $attrs->{Private} && ( keys %$attrs > 1 ) ) {
             $c->log->debug( 'Bad action definition "'
-                  . join( ' ', @{ $cache->[1] } )
-                  . qq/" for "$class->$method"/ )
+                  . join( ' ', @{ $attributes } )
+                  . qq/" for "$class->$name"/ )
               if $c->debug;
             next;
         }
-        my $reverse = $namespace ? "${namespace}/${method}" : $method;
+        my $reverse = $namespace ? "${namespace}/${name}" : $name;
         my $action = $self->create_action(
-            name       => $method,
-            code       => $code,
+            name       => $name,
+            code       => $method->body,
             reverse    => $reverse,
             namespace  => $namespace,
             class      => $class,
@@ -218,9 +235,15 @@ sub create_action {
     my $class = (exists $args{attributes}{ActionClass}
                     ? $args{attributes}{ActionClass}[0]
                     : $self->_action_class);
-
     Class::MOP::load_class($class);
-    return $class->new( \%args );
+
+    my $action_args = $self->config->{action_args};
+    my %extra_args = (
+        %{ $action_args->{'*'}           || {} },
+        %{ $action_args->{ $args{name} } || {} },
+    );
+
+    return $class->new({ %extra_args, %args });
 }
 
 sub _parse_attrs {
@@ -249,7 +272,7 @@ sub _parse_attrs {
     # superior while mantaining really high degree of compat
     my $actions;
     if( ref($self) ) {
-        $actions = $self->actions;
+        $actions = $self->_controller_actions;
     } else {
         my $cfg = $self->config;
         $actions = $self->merge_config_hashes($cfg->{actions}, $cfg->{action});
@@ -295,7 +318,7 @@ sub _parse_Relative_attr { shift->_parse_Local_attr(@_); }
 
 sub _parse_Path_attr {
     my ( $self, $c, $name, $value ) = @_;
-    $value ||= '';
+    $value = '' if !defined $value;
     if ( $value =~ m!^/! ) {
         return ( 'Path', $value );
     }
@@ -317,16 +340,56 @@ sub _parse_Regexp_attr { shift->_parse_Regex_attr(@_); }
 sub _parse_LocalRegex_attr {
     my ( $self, $c, $name, $value ) = @_;
     unless ( $value =~ s/^\^// ) { $value = "(?:.*?)$value"; }
-    return ( 'Regex', '^' . $self->path_prefix($c) . "/${value}" );
+
+    my $prefix = $self->path_prefix( $c );
+    $prefix .= '/' if length( $prefix );
+
+    return ( 'Regex', "^${prefix}${value}" );
 }
 
 sub _parse_LocalRegexp_attr { shift->_parse_LocalRegex_attr(@_); }
 
+sub _parse_Chained_attr {
+    my ($self, $c, $name, $value) = @_;
+
+    if (defined($value) && length($value)) {
+        if ($value eq '.') {
+            $value = '/'.$self->action_namespace($c);
+        } elsif (my ($rel, $rest) = $value =~ /^((?:\.{2}\/)+)(.*)$/) {
+            my @parts = split '/', $self->action_namespace($c);
+            my @levels = split '/', $rel;
+
+            $value = '/'.join('/', @parts[0 .. $#parts - @levels], $rest);
+        } elsif ($value !~ m/^\//) {
+            my $action_ns = $self->action_namespace($c);
+
+            if ($action_ns) {
+                $value = '/'.join('/', $action_ns, $value);
+            } else {
+                $value = '/'.$value; # special case namespace '' (root)
+            }
+        }
+    } else {
+        $value = '/'
+    }
+
+    return Chained => $value;
+}
+
+sub _parse_ChainedParent_attr {
+    my ($self, $c, $name, $value) = @_;
+    return $self->_parse_Chained_attr($c, $name, '../'.$name);
+}
+
+sub _parse_PathPrefix_attr {
+    my ( $self, $c ) = @_;
+    return PathPart => $self->path_prefix($c);
+}
+
 sub _parse_ActionClass_attr {
     my ( $self, $c, $name, $value ) = @_;
-    unless ( $value =~ s/^\+// ) {
-      $value = join('::', $self->_action_class, $value );
-    }
+    my $appname = $self->_application;
+    $value = Catalyst::Utils::resolve_namespace($appname . '::Action', $self->_action_class, $value);
     return ( 'ActionClass', $value );
 }
 
@@ -339,10 +402,10 @@ sub _parse_MyAction_attr {
     return ( 'ActionClass', $value );
 }
 
-no Moose;
+__PACKAGE__->meta->make_immutable;
 
 1;
 
 __END__
 
-#line 441
+#line 532
